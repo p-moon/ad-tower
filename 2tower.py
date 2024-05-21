@@ -27,6 +27,9 @@ if not os.path.exists("./dataset"):
 
 dataset_path = "./dataset/ml-1m"
 
+import torch
+import torch.nn as nn
+
 class SelfAttention(nn.Module):
     def __init__(self, embed_size, heads):
         super(SelfAttention, self).__init__()
@@ -38,31 +41,24 @@ class SelfAttention(nn.Module):
             self.head_dim * heads == embed_size
         ), "Embedding size needs to be divisible by heads"
 
-        self.values = nn.Linear(self.head_dim, self.head_dim, bias=False)
-        self.keys = nn.Linear(self.head_dim, self.head_dim, bias=False)
-        self.queries = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.values = nn.Linear(embed_size, embed_size, bias=False)
+        self.keys = nn.Linear(embed_size, embed_size, bias=False)
+        self.queries = nn.Linear(embed_size, embed_size, bias=False)
         self.fc_out = nn.Linear(heads * self.head_dim, embed_size)
 
     def forward(self, values, keys, query, mask):
         N = query.shape[0]
         value_len, key_len, query_len = values.shape[1], keys.shape[1], query.shape[1]
 
-        print(f"values shape before reshape: {values.shape}")
-        print(f"keys shape before reshape: {keys.shape}")
-        print(f"queries shape before reshape: {query.shape}")
-
-        # Split the embedding into self.heads different pieces
-        values = values.reshape(N, value_len, self.heads, self.head_dim)
-        keys = keys.reshape(N, key_len, self.heads, self.head_dim)
-        queries = query.reshape(N, query_len, self.heads, self.head_dim)
-
-        print(f"values shape after reshape: {values.shape}")
-        print(f"keys shape after reshape: {keys.shape}")
-        print(f"queries shape after reshape: {queries.shape}")
-
+        # Transform input using linear layers
         values = self.values(values)
         keys = self.keys(keys)
-        queries = self.queries(queries)
+        queries = self.queries(query)
+
+        # Reshape for multi-head attention
+        values = values.reshape(N, value_len, self.heads, self.head_dim)
+        keys = keys.reshape(N, key_len, self.heads, self.head_dim)
+        queries = queries.reshape(N, query_len, self.heads, self.head_dim)
 
         # Einsum does matrix multiplication for query*keys for each training example
         # with every other key
@@ -71,7 +67,7 @@ class SelfAttention(nn.Module):
         if mask is not None:
             attention = attention.masked_fill(mask == 0, float("-1e20"))
 
-        attention = torch.softmax(attention / (self.embed_size ** (1 / 2)), dim=3)
+        attention = torch.softmax(attention / (self.head_dim ** (1 / 2)), dim=3)
 
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(
             N, query_len, self.heads * self.head_dim
@@ -79,6 +75,21 @@ class SelfAttention(nn.Module):
 
         out = self.fc_out(out)
         return out
+
+# Testing the modified SelfAttention class
+N = 2  # batch size
+seq_length = 3  # sequence length
+embed_size = 8  # embedding size
+
+values = torch.randn(N, seq_length, embed_size)
+keys = torch.randn(N, seq_length, embed_size)
+query = torch.randn(N, seq_length, embed_size)
+
+attention_modified = SelfAttention(embed_size, 4)
+output_modified = attention_modified(values, keys, query, None)
+
+print(output_modified.shape)
+
 
 class Tower(nn.Module):
     def __init__(self, embed_size, heads, num_layers, forward_expansion, max_length, dropout, device):
