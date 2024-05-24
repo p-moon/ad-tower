@@ -1,16 +1,15 @@
 import requests
 import os
 import zipfile
+import torch
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
+from torch.utils.data import TensorDataset
+from tqdm import tqdm
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 下载和解压数据集
 if not os.path.exists("./dataset"):
@@ -23,210 +22,143 @@ if not os.path.exists("./dataset"):
 
     with zipfile.ZipFile(file_path, "r") as zip_ref:
         zip_ref.extractall("./dataset")
-
+        
 
 dataset_path = "./dataset/ml-1m"
 
+ratings = pd.read_csv(os.path.join(dataset_path, "ratings.dat"), sep='::', engine='python', names=['user_id', 'movie_id', 'rating', 'timestamp'])
+ratings.head()
+
+
+# 将用户ID和电影ID转换为整型
+ratings['user_id'] = ratings['user_id'] - 1
+ratings['movie_id'] = ratings['movie_id'] - 1
+
+# 将数据集分为训练集和测试集
+train_data, test_data = train_test_split(ratings, test_size=0.2, random_state=42)
+
+train_data.head()
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-class SelfAttention(nn.Module):
-    def __init__(self, embed_size, heads):
-        super(SelfAttention, self).__init__()
-        self.embed_size = embed_size
-        self.heads = heads
-        self.head_dim = embed_size // heads
+class UserTower(nn.Module):
+    def __init__(self, user_num, item_num, emb_size, hidden_size):
+        super(UserTower, self).__init__()
+        self.user_emb = nn.Embedding(user_num, emb_size)
+        self.item_emb = nn.Embedding(item_num, emb_size)
+        self.user_emb.to(device)
+        self.item_emb.to(device)
+        self.fc1 = nn.Linear(emb_size * 2, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, emb_size)
 
-        assert (
-            self.head_dim * heads == embed_size
-        ), "Embedding size needs to be divisible by heads"
+    def forward(self, user_id, item_ids):
+        user_emb = self.user_emb(user_id)
+        item_embs = self.item_emb(item_ids)
+        # 使用self-attention计算用户最近浏览的素材的权重
+        attention_weights = F.softmax(torch.matmul(item_embs, user_emb.unsqueeze(2)), dim=1)
+        user_rep = torch.sum(attention_weights * item_embs, dim=1)
+        # 将用户表示和用户嵌入拼接
+        user_rep = torch.cat((user_emb, user_rep), dim=1)
+        # 通过MLP得到最终的 user tower 输出
+        user_rep = F.relu(self.fc1(user_rep))
+        user_rep = self.fc2(user_rep)
+        return user_rep
 
-        self.values = nn.Linear(embed_size, embed_size, bias=False)
-        self.keys = nn.Linear(embed_size, embed_size, bias=False)
-        self.queries = nn.Linear(embed_size, embed_size, bias=False)
-        self.fc_out = nn.Linear(heads * self.head_dim, embed_size)
+class ItemTower(nn.Module):
+    def __init__(self, item_num, emb_size, hidden_size):
+        super(ItemTower, self).__init__()
+        self.item_emb = nn.Embedding(item_num, emb_size)
+        self.item_emb.to(device)
+        self.fc1 = nn.Linear(emb_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, emb_size)
 
-    def forward(self, values, keys, query, mask):
-        N = query.shape[0]
-        value_len, key_len, query_len = values.shape[1], keys.shape[1], query.shape[1]
-
-        # Transform input using linear layers
-        values = self.values(values)
-        keys = self.keys(keys)
-        queries = self.queries(query)
-
-        # Reshape for multi-head attention
-        values = values.reshape(N, value_len, self.heads, self.head_dim)
-        keys = keys.reshape(N, key_len, self.heads, self.head_dim)
-        queries = queries.reshape(N, query_len, self.heads, self.head_dim)
-
-        # Einsum does matrix multiplication for query*keys for each training example
-        # with every other key
-        attention = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
-        
-        if mask is not None:
-            attention = attention.masked_fill(mask == 0, float("-1e20"))
-
-        attention = torch.softmax(attention / (self.head_dim ** (1 / 2)), dim=3)
-
-        out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(
-            N, query_len, self.heads * self.head_dim
-        )
-
-        out = self.fc_out(out)
-        return out
-
-# Testing the modified SelfAttention class
-N = 2  # batch size
-seq_length = 3  # sequence length
-embed_size = 8  # embedding size
-
-values = torch.randn(N, seq_length, embed_size)
-keys = torch.randn(N, seq_length, embed_size)
-query = torch.randn(N, seq_length, embed_size)
-
-attention_modified = SelfAttention(embed_size, 4)
-output_modified = attention_modified(values, keys, query, None)
-
-print(output_modified.shape)
+    def forward(self, item_id):
+        item_emb = self.item_emb(item_id)
+        # 通过MLP得到最终的 item tower 输出
+        item_rep = F.relu(self.fc1(item_emb))
+        item_rep = self.fc2(item_rep)
+        return item_rep
 
 
-class Tower(nn.Module):
-    def __init__(self, embed_size, heads, num_layers, forward_expansion, max_length, dropout, device):
-        super(Tower, self).__init__()
-        self.embed_size = embed_size
-        self.device = device
-        self.layers = nn.ModuleList(
-            [
-                SelfAttention(embed_size, heads)
-                for _ in range(num_layers)
-            ]
-        )
 
-        self.dropout = nn.Dropout(dropout)
-        self.fc_out = nn.Linear(embed_size, embed_size)
+def train_model(user_tower, item_tower, user_id, item_ids, ratings, optimizer):
+    user_id = user_id.to(device)
+    item_ids = item_ids.to(device)
+    ratings = ratings.to(device)
+    user_tower.train()
+    item_tower.train()
+    optimizer.zero_grad()
+    user_rep = user_tower(user_id, item_ids)
+    item_rep = item_tower(item_ids)
+    # 计算预测评分
+    pred_scores = torch.sum(user_rep * item_rep, dim=1)
+    loss = F.mse_loss(pred_scores, ratings)
+    loss.backward()
+    optimizer.step()
+    return loss.item()
 
-    def forward(self, x, mask):
-        for layer in self.layers:
-            x = layer(x, x, x, mask)
-
-        x = self.dropout(x)
-        x = self.fc_out(x)
-        return x
-
-class DualTowerModel(nn.Module):
-    def __init__(
-        self,
-        user_embed_size,
-        item_embed_size,
-        heads,
-        num_layers,
-        forward_expansion,
-        max_length,
-        dropout,
-        device,
-    ):
-        super(DualTowerModel, self).__init__()
-        self.user_tower = Tower(user_embed_size, heads, num_layers, forward_expansion, max_length, dropout, device)
-        self.item_tower = Tower(item_embed_size, heads, num_layers, forward_expansion, max_length, dropout, device)
-
-        self.fc = nn.Linear(user_embed_size + item_embed_size, 1)
-        self.device = device
-
-    def forward(self, user_embed, item_embed, user_mask, item_mask):
-        user_out = self.user_tower(user_embed, user_mask)
-        item_out = self.item_tower(item_embed, item_mask)
-
-        # Concatenate user and item embeddings
-        combined = torch.cat((user_out, item_out), dim=1)
-        out = torch.sigmoid(self.fc(combined))
-        return out
-
-# Set the device to "cuda" if available, otherwise use "cpu"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Hyperparameters
-user_embed_size = 128
-item_embed_size = 128
-heads = 4
-num_layers = 2
-forward_expansion = 4
-max_length = 100
-dropout = 0.1
-
-# Initialize the model
-model = DualTowerModel(user_embed_size, item_embed_size, heads, num_layers, forward_expansion, max_length, dropout, device)
-model = model.to(device)
-
-model
+def evaluate_model(user_tower, item_tower, user_id, item_ids, ratings):
+    user_id = user_id.to(device)
+    item_ids = item_ids.to(device)
+    ratings = ratings.to(device)
+    user_tower.eval()
+    item_tower.eval()
+    with torch.no_grad():
+        user_rep = user_tower(user_id, item_ids)
+        item_rep = item_tower(item_ids)
+        # 计算预测评分
+        pred_scores = torch.sum(user_rep * item_rep, dim=1)
+        rmse = np.sqrt(F.mse_loss(pred_scores, ratings).item())
+    return rmse
 
 
-ratings = pd.read_csv(os.path.join(dataset_path, "ratings.dat"), sep='::', engine='python', names=['user_id', 'movie_id', 'rating', 'timestamp'])
+user_num = ratings['user_id'].max() + 1
+item_num = ratings['movie_id'].max() + 1
 
 
-# Define the number of users and movies in the dataset
-num_users = ratings['user_id'].nunique()
-num_movies = ratings['movie_id'].nunique()
 
-# Define the embedding layers for users and movies
-user_embedding = nn.Embedding(num_users + 1, user_embed_size)
-movie_embedding = nn.Embedding(num_movies + 1, item_embed_size)
-user_embedding.to(device)
-movie_embedding.to(device)
+# 创建TensorDataset时，将用户ID和电影ID转换为浮点数
+train_dataset = TensorDataset(torch.tensor(train_data['user_id'].values, dtype=torch.long), 
+                              torch.tensor(train_data['movie_id'].values, dtype=torch.long), 
+                              torch.tensor(train_data['rating'].values, dtype=torch.float))  # 将rating转换为torch.float
 
-# Prepare the dataset for training
-def prepare_data(ratings):
-    user_ids = ratings['user_id'].values
-    movie_ids = ratings['movie_id'].values
-    ratings = ratings['rating'].values
-
-    # Convert ratings to binary labels (1 for rating >= 4, 0 otherwise)
-    labels = (ratings >= 4).astype(int)
-
-    return user_ids, movie_ids, labels
-
-user_ids, movie_ids, labels = prepare_data(ratings)
-
-# Move the data to the device
-user_ids = torch.tensor(user_ids, dtype=torch.long).to(device)
-movie_ids = torch.tensor(movie_ids, dtype=torch.long).to(device)
-labels = torch.tensor(labels, dtype=torch.float).unsqueeze(1).to(device)
-
-user_ids, movie_ids, labels
+test_dataset = TensorDataset(torch.tensor(test_data['user_id'].values, dtype=torch.long), 
+                             torch.tensor(test_data['movie_id'].values, dtype=torch.long), 
+                             torch.tensor(test_data['rating'].values, dtype=torch.float))  # 将rating转换为torch.float
 
 
-# Define the loss function and optimizer
-criterion = nn.BCEWithLogitsLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+emb_size = 64
+hidden_size = 128
+batch_size = 32
+epochs = 10
+learning_rate = 0.001
+user_tower = UserTower(user_num, item_num, emb_size, hidden_size)
+item_tower = ItemTower(item_num, emb_size, hidden_size)
 
-model.to(device=device)
-# Define the training loop
-def train_model(model, user_ids, movie_ids, labels, num_epochs=5):
-    for epoch in range(num_epochs):
-        # Set the model to training mode
-        model.train()
+user_tower.to(device)
+item_tower.to(device)
 
-        # Forward pass
-        user_embed = user_embedding(user_ids)
-        movie_embed = movie_embedding(movie_ids)
-        user_mask = None  # We don't have padding in user embeddings, so no mask needed
-        movie_mask = None  # We don't have padding in movie embeddings, so no mask needed
 
-        outputs = model(user_embed, movie_embed, user_mask, movie_mask)
-        loss = criterion(outputs, labels)
+optimizer = torch.optim.Adam(list(user_tower.parameters()) + list(item_tower.parameters()), lr=learning_rate)
+# 创建DataLoader
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-        # Backward pass and optimization
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+with tqdm(total=epochs * len(train_loader)) as pbar:
+    for epoch in range(epochs):
+        for batch in train_loader:
+            user_ids, item_ids, ratings = batch
+            loss = train_model(user_tower, item_tower, user_ids, item_ids, ratings, optimizer)
+            pbar.set_postfix({'Loss': loss, 'LR': optimizer.param_groups[0]['lr']})
+            pbar.update()
 
-        # Evaluate the model
-        model.eval()
-        with torch.no_grad():
-            predictions = torch.round(torch.sigmoid(outputs))
-            accuracy = torch.mean((predictions == labels).float())
+# 在调用evaluate_model时，将Series转换为Tensor
+rmse = evaluate_model(user_tower, item_tower, 
+                      torch.tensor(test_data['user_id'].values, dtype=torch.long), 
+                      torch.tensor(test_data['movie_id'].values, dtype=torch.long), 
+                      torch.tensor(test_data['rating'].values, dtype=torch.float))
+print(f'Test RMSE: {rmse}')
 
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}, Accuracy: {accuracy.item():.4f}")
 
-# Start training
-train_model(model, user_ids, movie_ids, labels)
