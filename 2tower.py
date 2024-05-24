@@ -9,6 +9,11 @@ from torch.utils.data import DataLoader
 from torch.utils.data import TensorDataset
 from tqdm import tqdm
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 下载和解压数据集
@@ -39,9 +44,6 @@ train_data, test_data = train_test_split(ratings, test_size=0.2, random_state=42
 
 train_data.head()
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class UserTower(nn.Module):
     def __init__(self, user_num, item_num, emb_size, hidden_size):
