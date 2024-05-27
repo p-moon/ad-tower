@@ -133,8 +133,6 @@ def evaluate_model(user_tower, item_tower, data_loader):
     item_tower.eval()
     total_loss = 0
     total_samples = 0
-    all_predictions = []
-    all_ratings = []
     with torch.no_grad():
         for batch in data_loader:
             user_id, item_ids, ratings = batch
@@ -145,18 +143,10 @@ def evaluate_model(user_tower, item_tower, data_loader):
             item_rep = item_tower(item_ids)
             # 计算预测评分
             pred_scores = torch.sum(user_rep * item_rep, dim=1)
-            all_predictions.extend(pred_scores.cpu().numpy())
-            all_ratings.extend(ratings.cpu().numpy())
             loss = F.mse_loss(pred_scores, ratings, reduction='sum')
             total_loss += loss.item()
             total_samples += ratings.size(0)
     rmse = np.sqrt(total_loss / total_samples)
-
-    # 创建评估报告
-    data = [[pred, true] for pred, true in zip(all_predictions, all_ratings)]
-    table = wandb.Table(data=data, columns=["Predicted", "Actual"])
-    wandb.log({"Evaluation Results": table, "Test RMSE": rmse})
-
     return rmse
 
 user_num = len(user_id_map)
@@ -207,11 +197,9 @@ with tqdm(total=epochs * len(train_loader)) as pbar:
             loss = train_model(user_tower, item_tower, user_ids, item_ids, ratings, optimizer)
             epoch_loss += loss
             pbar.set_postfix({'Loss': loss, 'LR': optimizer.param_groups[0]['lr']})
-            wandb.log({"train Loss": loss})
-            wandb.log({"learn rate": optimizer.param_groups[0]['lr']})
             pbar.update()
-        
-        wandb.log({"Train epoch Loss": epoch_loss / len(train_loader)})
+        # 记录每个epoch的平均训练损失
+        wandb.log({"Train Loss": epoch_loss / len(train_loader)})
 
         # 在每个epoch结束时评估模型
         rmse = evaluate_model(user_tower, item_tower, test_loader)
@@ -233,7 +221,6 @@ torch.save({
     'train_loss': epoch_loss,
     'test_rmse': rmse
 }, './models/model_checkpoint.pth')
-
 # 加载模型
 checkpoint = torch.load('./models/model_checkpoint.pth')
 user_tower.load_state_dict(checkpoint['user_tower_state_dict'])
