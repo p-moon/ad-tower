@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 下载和解压数据集
@@ -27,31 +26,31 @@ if not os.path.exists("./dataset"):
 
     with zipfile.ZipFile(file_path, "r") as zip_ref:
         zip_ref.extractall("./dataset")
-        
 
 dataset_path = "./dataset/ml-1m"
 
 ratings = pd.read_csv(os.path.join(dataset_path, "ratings.dat"), sep='::', engine='python', names=['user_id', 'movie_id', 'rating', 'timestamp'])
 ratings.head()
 
+# 创建用户和电影ID的映射
+original_user_ids = ratings['user_id'].unique()
+original_movie_ids = ratings['movie_id'].unique()
 
-# 将用户ID和电影ID转换为整型
-ratings['user_id'] = ratings['user_id'] - 1
-ratings['movie_id'] = ratings['movie_id'] - 1
+user_id_map = {id: idx for idx, id in enumerate(original_user_ids)}
+movie_id_map = {id: idx for idx, id in enumerate(original_movie_ids)}
+
+# 应用映射
+ratings['user_id'] = ratings['user_id'].map(user_id_map)
+ratings['movie_id'] = ratings['movie_id'].map(movie_id_map)
 
 # 将数据集分为训练集和测试集
 train_data, test_data = train_test_split(ratings, test_size=0.2, random_state=42)
-
-train_data.head()
-
 
 class UserTower(nn.Module):
     def __init__(self, user_num, item_num, emb_size, hidden_size):
         super(UserTower, self).__init__()
         self.user_emb = nn.Embedding(user_num, emb_size)
         self.item_emb = nn.Embedding(item_num, emb_size)
-        self.user_emb.to(device)
-        self.item_emb.to(device)
         self.fc1 = nn.Linear(emb_size * 2, hidden_size)
         self.fc2 = nn.Linear(hidden_size, emb_size)
 
@@ -72,7 +71,6 @@ class ItemTower(nn.Module):
     def __init__(self, item_num, emb_size, hidden_size):
         super(ItemTower, self).__init__()
         self.item_emb = nn.Embedding(item_num, emb_size)
-        self.item_emb.to(device)
         self.fc1 = nn.Linear(emb_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, emb_size)
 
@@ -82,8 +80,6 @@ class ItemTower(nn.Module):
         item_rep = F.relu(self.fc1(item_emb))
         item_rep = self.fc2(item_rep)
         return item_rep
-
-
 
 def train_model(user_tower, item_tower, user_id, item_ids, ratings, optimizer):
     user_id = user_id.to(device)
@@ -101,25 +97,31 @@ def train_model(user_tower, item_tower, user_id, item_ids, ratings, optimizer):
     optimizer.step()
     return loss.item()
 
-def evaluate_model(user_tower, item_tower, user_id, item_ids, ratings):
-    user_id = user_id.to(device)
-    item_ids = item_ids.to(device)
-    ratings = ratings.to(device)
+def evaluate_model(user_tower, item_tower, data_loader):
     user_tower.eval()
     item_tower.eval()
-    with torch.no_grad():
-        user_rep = user_tower(user_id, item_ids)
-        item_rep = item_tower(item_ids)
-        # 计算预测评分
-        pred_scores = torch.sum(user_rep * item_rep, dim=1)
-        rmse = np.sqrt(F.mse_loss(pred_scores, ratings).item())
+    total_loss = 0
+    total_samples = 0
+    with tqdm(total=len(data_loader), desc="evaluate progress:") as pbar:
+        with torch.no_grad():
+            for batch in data_loader:
+                user_id, item_ids, ratings = batch
+                user_id = user_id.to(device)
+                item_ids = item_ids.to(device)
+                ratings = ratings.to(device)
+                user_rep = user_tower(user_id, item_ids)
+                item_rep = item_tower(item_ids)
+                # 计算预测评分
+                pred_scores = torch.sum(user_rep * item_rep, dim=1)
+                loss = F.mse_loss(pred_scores, ratings, reduction='sum')
+                total_loss += loss.item()
+                total_samples += ratings.size(0)
+                pbar.update()
+    rmse = np.sqrt(total_loss / total_samples)
     return rmse
 
-
-user_num = ratings['user_id'].max() + 1
-item_num = ratings['movie_id'].max() + 1
-
-
+user_num = len(user_id_map)
+item_num = len(movie_id_map)
 
 # 创建TensorDataset时，将用户ID和电影ID转换为浮点数
 train_dataset = TensorDataset(torch.tensor(train_data['user_id'].values, dtype=torch.long), 
@@ -130,10 +132,9 @@ test_dataset = TensorDataset(torch.tensor(test_data['user_id'].values, dtype=tor
                              torch.tensor(test_data['movie_id'].values, dtype=torch.long), 
                              torch.tensor(test_data['rating'].values, dtype=torch.float))  # 将rating转换为torch.float
 
-
 emb_size = 64
 hidden_size = 128
-batch_size = 32
+batch_size = 16  # 减小 batch size 以减少显存使用
 epochs = 10
 learning_rate = 0.001
 user_tower = UserTower(user_num, item_num, emb_size, hidden_size)
@@ -142,13 +143,12 @@ item_tower = ItemTower(item_num, emb_size, hidden_size)
 user_tower.to(device)
 item_tower.to(device)
 
-
 optimizer = torch.optim.Adam(list(user_tower.parameters()) + list(item_tower.parameters()), lr=learning_rate)
 # 创建DataLoader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-with tqdm(total=epochs * len(train_loader)) as pbar:
+with tqdm(total=epochs * len(train_loader), desc="train progress:") as pbar:
     for epoch in range(epochs):
         for batch in train_loader:
             user_ids, item_ids, ratings = batch
@@ -156,11 +156,6 @@ with tqdm(total=epochs * len(train_loader)) as pbar:
             pbar.set_postfix({'Loss': loss, 'LR': optimizer.param_groups[0]['lr']})
             pbar.update()
 
-# 在调用evaluate_model时，将Series转换为Tensor
-rmse = evaluate_model(user_tower, item_tower, 
-                      torch.tensor(test_data['user_id'].values, dtype=torch.long), 
-                      torch.tensor(test_data['movie_id'].values, dtype=torch.long), 
-                      torch.tensor(test_data['rating'].values, dtype=torch.float))
+# 使用批处理的方式进行评估
+rmse = evaluate_model(user_tower, item_tower, test_loader)
 print(f'Test RMSE: {rmse}')
-
-
